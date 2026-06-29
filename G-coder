@@ -1,0 +1,309 @@
+import numpy as np
+import time
+import sys
+
+# Try to import sound libraries
+try:
+    import sounddevice as sd
+    import soundfile as sf
+except ImportError:
+    print("Installing required libraries...")
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "sounddevice", "numpy"])
+    import sounddevice as sd
+    import numpy as np
+
+class PhoneEcholocator:
+    def __init__(self):
+        # Audio parameters
+        self.SAMPLE_RATE = 48000  # Hz (maximum for most phones)
+        self.SOUND_SPEED = 343    # m/s (at 20°C)
+        
+        # Signal parameters
+        self.FREQ = 1800          # Signal frequency (Hz)
+        self.PULSE_DURATION = 0.03 # Pulse duration (seconds)
+        self.RECORD_DURATION = 0.5 # Recording duration (seconds)
+        
+        # Calibration data
+        self.system_delay = 0.0    # System delay (calibrated)
+        self.is_calibrated = False
+        
+        # Measurement history
+        self.history = []
+        self.max_history = 10
+        
+        print("🔄 Initializing echolocator...")
+        print(f"📊 Sample rate: {self.SAMPLE_RATE} Hz")
+        print(f"🎵 Signal frequency: {self.FREQ} Hz")
+        print(f"⏱ Pulse duration: {self.PULSE_DURATION*1000:.1f} ms")
+        
+    def generate_pulse(self):
+        """Generates a sound pulse"""
+        t = np.linspace(0, self.PULSE_DURATION, int(self.SAMPLE_RATE * self.PULSE_DURATION))
+        
+        # Main signal (sine wave)
+        pulse = np.sin(2 * np.pi * self.FREQ * t)
+        
+        # Envelope for soft start and end (to avoid clicks)
+        envelope = np.hanning(len(pulse))
+        pulse = pulse * envelope
+        
+        return pulse
+    
+    def play_pulse(self):
+        """Plays the pulse"""
+        pulse = self.generate_pulse()
+        sd.play(pulse, self.SAMPLE_RATE)
+        return pulse
+    
+    def record_echo(self):
+        """Records the echo"""
+        recording = sd.rec(
+            int(self.SAMPLE_RATE * self.RECORD_DURATION),
+            samplerate=self.SAMPLE_RATE,
+            channels=1,
+            dtype='float32'
+        )
+        sd.wait()  # Wait for recording to finish
+        return recording.flatten()
+    
+    def find_echo(self, signal, reference):
+        """Finds echo using cross-correlation"""
+        # Compute cross-correlation
+        correlation = np.correlate(signal, reference, mode='same')
+        
+        # Find correlation peak
+        peak_index = np.argmax(np.abs(correlation))
+        peak_value = np.max(np.abs(correlation))
+        
+        # Calculate delay in seconds
+        delay_samples = peak_index - len(reference) // 2
+        delay_seconds = delay_samples / self.SAMPLE_RATE
+        
+        # Quality assessment (signal-to-noise ratio)
+        noise_floor = np.mean(np.abs(correlation))
+        snr = peak_value / (noise_floor + 1e-10)
+        
+        return delay_seconds, snr, peak_value
+    
+    def calibrate(self):
+        """Calibrates the system (measures speaker->microphone delay)"""
+        print("\n🔧 CALIBRATION")
+        print("📱 Cover the speaker with the microphone (press phone against yourself)")
+        print("⏳ Waiting...")
+        
+        # Measure delay 5 times
+        delays = []
+        for i in range(5):
+            # Generate and play signal
+            ref = self.generate_pulse()
+            sd.play(ref, self.SAMPLE_RATE)
+            
+            # Start recording with minimal delay
+            time.sleep(0.001)
+            recording = self.record_echo()
+            
+            # Find echo
+            delay, snr, _ = self.find_echo(recording, ref)
+            
+            if snr > 1.5:  # Good signal
+                delays.append(delay)
+                print(f"  Measurement {i+1}: {delay*1000:.2f} ms, SNR: {snr:.1f}")
+            else:
+                print(f"  Measurement {i+1}: Weak signal (SNR: {snr:.1f})")
+            
+            time.sleep(0.1)
+        
+        # Average the delay
+        if delays:
+            self.system_delay = np.mean(delays)
+            self.is_calibrated = True
+            print(f"\n✅ Calibration complete!")
+            print(f"⏱ System delay: {self.system_delay*1000:.2f} ms")
+            print(f"📏 Equivalent distance: {(self.SOUND_SPEED*self.system_delay)/2:.2f} m\n")
+        else:
+            print("\n❌ Calibration failed. Using default delay of 30 ms")
+            self.system_delay = 0.03
+            self.is_calibrated = True
+    
+    def measure_distance(self, verbose=True):
+        """Performs a single distance measurement"""
+        if not self.is_calibrated:
+            print("⚠️ Please calibrate first!")
+            return None
+        
+        # Generate and play signal
+        ref = self.generate_pulse()
+        sd.play(ref, self.SAMPLE_RATE)
+        
+        # Small delay before recording (to avoid capturing direct sound)
+        time.sleep(0.005)
+        
+        # Record
+        recording = self.record_echo()
+        
+        # Find echo
+        delay, snr, peak = self.find_echo(recording, ref)
+        
+        # Subtract system delay
+        corrected_delay = delay - self.system_delay
+        
+        # Ignore if delay is negative or too small
+        if corrected_delay < 0.001:
+            if verbose:
+                print("❌ Echo too close or absent")
+            return None
+        
+        # Calculate distance
+        distance = (self.SOUND_SPEED * corrected_delay) / 2
+        
+        # Check quality
+        if snr < 2.0:
+            if verbose:
+                print(f"⚠️ Low signal quality (SNR: {snr:.1f})")
+            return None
+        
+        # Save to history
+        self.history.append(distance)
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+        
+        return distance
+    
+    def get_smoothed_distance(self):
+        """Returns averaged distance from history"""
+        if not self.history:
+            return None
+        
+        # Remove outliers (median filter)
+        sorted_history = sorted(self.history)
+        trimmed = sorted_history[len(sorted_history)//4:-len(sorted_history)//4]
+        
+        if trimmed:
+            return np.mean(trimmed)
+        else:
+            return np.mean(self.history)
+    
+    def continuous_mode(self, duration=30):
+        """Continuous measurement mode"""
+        print(f"\n🔄 CONTINUOUS MODE (for {duration} seconds)")
+        print("📊 Press Ctrl+C to stop\n")
+        
+        start_time = time.time()
+        measurements = []
+        
+        try:
+            while time.time() - start_time < duration:
+                dist = self.measure_distance(verbose=False)
+                
+                if dist is not None:
+                    measurements.append(dist)
+                    avg_dist = np.mean(measurements[-5:]) if len(measurements) >= 5 else dist
+                    
+                    # Distance visualization
+                    bar_length = int(avg_dist * 2)  # 1 m = 2 characters
+                    bar = "█" * min(bar_length, 40)
+                    print(f"📏 {avg_dist:6.2f} m  [{bar}]")
+                else:
+                    print("⏳ Waiting for echo...")
+                
+                time.sleep(0.2)  # Pause between measurements
+                
+        except KeyboardInterrupt:
+            print("\n\n⏹ Stopping measurements")
+        
+        # Statistics
+        if measurements:
+            print(f"\n📊 Statistics:")
+            print(f"  Average: {np.mean(measurements):.2f} m")
+            print(f"  Min: {np.min(measurements):.2f} m")
+            print(f"  Max: {np.max(measurements):.2f} m")
+            print(f"  Std deviation: {np.std(measurements):.2f} m")
+        else:
+            print("\n❌ No measurements obtained")
+
+def main():
+    """Main function"""
+    print("=" * 50)
+    print("📡 MOBILE ECHOLOCATOR")
+    print("=" * 50)
+    print("\nInstructions:")
+    print("1. Connect headphones or use external speaker")
+    print("2. Point the phone at the object")
+    print("3. Perform calibration")
+    print("4. Start measurements\n")
+    
+    echolocator = PhoneEcholocator()
+    
+    while True:
+        print("\n" + "-" * 50)
+        print("Select action:")
+        print("1. Calibration (required before first use)")
+        print("2. Single measurement")
+        print("3. Continuous mode (30 sec)")
+        print("4. Show measurement history")
+        print("5. Reset calibration")
+        print("6. Exit")
+        
+        choice = input("\nYour choice: ").strip()
+        
+        if choice == '1':
+            echolocator.calibrate()
+            
+        elif choice == '2':
+            if not echolocator.is_calibrated:
+                print("⚠️ Please calibrate first!")
+                continue
+            
+            print("\n🔊 Measuring...")
+            dist = echolocator.measure_distance()
+            
+            if dist is not None:
+                smoothed = echolocator.get_smoothed_distance()
+                print(f"\n✅ Distance: {dist:.2f} m")
+                if smoothed and smoothed != dist:
+                    print(f"📊 Smoothed: {smoothed:.2f} m")
+            else:
+                print("\n❌ Failed to measure distance")
+                print("💡 Try:")
+                print("  - Increase volume")
+                print("  - Move closer to the object")
+                print("  - Use a quieter room")
+                
+        elif choice == '3':
+            if not echolocator.is_calibrated:
+                print("⚠️ Please calibrate first!")
+                continue
+            echolocator.continuous_mode(duration=30)
+            
+        elif choice == '4':
+            if echolocator.history:
+                print(f"\n📊 Last {len(echolocator.history)} measurements:")
+                for i, d in enumerate(echolocator.history, 1):
+                    print(f"  {i}: {d:.2f} m")
+                avg = np.mean(echolocator.history)
+                print(f"\n📈 Average: {avg:.2f} m")
+            else:
+                print("\n❌ No saved measurements")
+                
+        elif choice == '5':
+            echolocator.is_calibrated = False
+            echolocator.system_delay = 0.0
+            print("\n🔄 Calibration reset")
+            
+        elif choice == '6':
+            print("\n👋 Goodbye!")
+            break
+            
+        else:
+            print("\n❌ Invalid choice. Please try again.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n👋 Program stopped")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        print("💡 Make sure libraries are installed:")
+        print("   pip install sounddevice numpy")
